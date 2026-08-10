@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(uv sync)",
+      "Bash(uv sync *)",
+      "Bash(uv pip install -e .)",
+      "Bash(uv venv*)",
+      "Bash(uvicorn deep_research_agents.api.main:app*)",
+      "Bash(pkill -f \"uvicorn deep_research_agents*\")",
+      "Bash(curl *localhost:8000*)",
+      "Bash(python3 -c *)",
+      "Bash(python3 -m json.tool)",
+      "Bash(git status)",
+      "Bash(git diff*)",
+      "Bash(git log*)",
+      "Bash(git add *)",
+      "Bash(git commit -m *)",
+      "Bash(ls*)",
+      "Bash(find *)"
+    ]
+  }
+}
