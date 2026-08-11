@@ -16,10 +16,11 @@ Key features:
 from typing_extensions import Literal
 
 from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage, filter_messages
+from langchain_core.runnables import RunnableConfig
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.graph import StateGraph, START, END
 
-from deep_research_agents.config import get_model
+from deep_research_agents.config import get_model, session_kwargs, thread_id_from_config
 from deep_research_agents.prompts import research_agent_prompt_with_mcp, compress_research_system_prompt, compress_research_human_message
 from deep_research_agents.state_research import ResearcherState, ResearcherOutputState
 from deep_research_agents.utils import get_today_str, think_tool, get_current_dir
@@ -55,7 +56,7 @@ model = get_model("research")
 
 # ===== AGENT NODES =====
 
-async def llm_call(state: ResearcherState):
+async def llm_call(state: ResearcherState, config: RunnableConfig):
     """Analyze current state and decide on tool usage with MCP integration.
 
     This node:
@@ -79,7 +80,8 @@ async def llm_call(state: ResearcherState):
     return {
         "researcher_messages": [
             model_with_tools.invoke(
-                [SystemMessage(content=research_agent_prompt_with_mcp.format(date=get_today_str()))] + state["researcher_messages"]
+                [SystemMessage(content=research_agent_prompt_with_mcp.format(date=get_today_str()))] + state["researcher_messages"],
+                **session_kwargs(thread_id_from_config(config)),
             )
         ]
     }
@@ -133,7 +135,7 @@ async def tool_node(state: ResearcherState):
 
     return {"researcher_messages": messages}
 
-def compress_research(state: ResearcherState) -> dict:
+def compress_research(state: ResearcherState, config: RunnableConfig) -> dict:
     """Compress research findings into a concise summary.
 
     Takes all the research messages and tool outputs and creates
@@ -146,7 +148,7 @@ def compress_research(state: ResearcherState) -> dict:
     system_message = compress_research_system_prompt.format(date=get_today_str())
     messages = [SystemMessage(content=system_message)] + state.get("researcher_messages", []) + [HumanMessage(content=compress_research_human_message)]
 
-    response = compress_model.invoke(messages)
+    response = compress_model.invoke(messages, **session_kwargs(thread_id_from_config(config)))
 
     # Extract raw notes from tool and AI messages
     raw_notes = [

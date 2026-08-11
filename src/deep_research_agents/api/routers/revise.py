@@ -35,7 +35,7 @@ async def revise_report(thread_id: str, body: ReviseRequest, request: Request):
     result = await final_report_generation({
         "notes": notes,
         "research_brief": state.values.get("research_brief", ""),
-    })
+    }, config)
 
     await graph.aupdate_state(config, {"final_report": result["final_report"]})
     return {"final_report": result["final_report"]}
