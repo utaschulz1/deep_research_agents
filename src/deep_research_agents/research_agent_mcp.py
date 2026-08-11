@@ -157,7 +157,7 @@ def compress_research(state: ResearcherState) -> dict:
     ]
 
     return {
-        "compressed_research": str(response.content),
+        "research_findings": str(response.content),
         "raw_notes": ["\n".join(raw_notes)]
     }
 

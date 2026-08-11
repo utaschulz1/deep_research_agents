@@ -1,7 +1,7 @@
 """Agent registry — maps agent_id to its graph builder, display metadata, and input adapter.
 
 The 5 graphs do not share one input schema: scope_research/agent take
-{"messages": [...]}, research_agent/agent_mcp take {"researcher_messages": [...],
+{"messages": [...]}, research_agent_sub/agent_mcp take {"researcher_messages": [...],
 "research_topic": str}, supervisor_agent takes {"supervisor_messages": [...],
 "research_brief": str}. Each registry entry carries an input_adapter that turns
 POST /threads/{id}/runs' plain {"message": "..."} body into the right shape.
@@ -13,7 +13,7 @@ from langchain_core.messages import HumanMessage
 from langgraph.graph import StateGraph
 
 from deep_research_agents.research_agent_scope import scope_research_builder
-from deep_research_agents.research_agent import researcher_agent_builder
+from deep_research_agents.research_agent_sub import researcher_agent_sub_builder
 from deep_research_agents.research_agent_mcp import agent_builder_mcp
 from deep_research_agents.multi_agent_supervisor import supervisor_builder
 from deep_research_agents.research_agent_full import deep_researcher_builder
@@ -46,9 +46,9 @@ AGENT_REGISTRY: dict[str, AgentEntry] = {
         "Clarifies the user's request and produces a research brief.",
         _messages_input,
     ),
-    "research_agent": AgentEntry(
-        researcher_agent_builder,
-        "Research Agent",
+    "research_agent_sub": AgentEntry(
+        researcher_agent_sub_builder,
+        "Sub-Researcher",
         "Single agent performing iterative web search and reflection on one topic.",
         _researcher_input,
     ),

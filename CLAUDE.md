@@ -17,13 +17,13 @@ src/deep_research_agents/
 ├── config.py                 # Settings (pydantic-settings) + get_model(role) — the ONLY place that knows about OpenRouter
 ├── prompts.py                 # All prompt templates, ported from the course, unmodified
 ├── state_scope.py             # AgentState / AgentInputState for scope_research and research_agent_full
-├── state_research.py          # ResearcherState / ResearcherOutputState for research_agent / research_agent_mcp
+├── state_research.py          # ResearcherState / ResearcherOutputState for research_agent_sub / research_agent_mcp
 ├── state_supervisor.py        # SupervisorState + ConductResearch/ResearchComplete tools
-├── utils.py                   # Tavily search pipeline, think_tool, get_today_str
+├── utils.py                   # Tavily search pipeline + brief-aware per-link extraction, think_tool, get_today_str
 ├── research_agent_scope.py    # Graph 1: clarify_with_user -> write_research_brief          -> scope_research
-├── research_agent.py          # Graph 2: search+reflect loop over Tavily                     -> researcher_agent
+├── research_agent_sub.py      # Graph 2: derive_checklist -> search+reflect loop over Tavily -> researcher_agent_sub
 ├── research_agent_mcp.py      # Graph 3: same loop but over a local MCP filesystem server    -> agent_mcp
-├── multi_agent_supervisor.py  # Graph 4: supervisor fans out parallel research_agent calls   -> supervisor_agent
+├── multi_agent_supervisor.py  # Graph 4: supervisor fans out parallel research_agent_sub calls -> supervisor_agent
 ├── research_agent_full.py     # Graph 5: full pipeline (1 -> 4 -> final_report_generation)   -> agent
 ├── graphs.py                  # AGENT_REGISTRY — maps agent_id to {builder, name, description, input_adapter}
 ├── db.py                      # ThreadStore — separate `threads` metadata table, own aiosqlite connection
@@ -43,7 +43,7 @@ src/deep_research_agents/
 
 They don't share an input schema:
 - `scope_research`, `agent` (full pipeline) take `{"messages": [...]}`
-- `researcher_agent`, `agent_mcp` take `{"researcher_messages": [...], "research_topic": str}`
+- `researcher_agent_sub`, `agent_mcp` take `{"researcher_messages": [...], "research_topic": str}`
 - `supervisor_agent` takes `{"supervisor_messages": [...], "research_brief": str}`
 
 `graphs.py`'s `AGENT_REGISTRY` carries a per-agent `input_adapter: Callable[[str], dict]` so the API's plain `{"message": "..."}` request body gets translated correctly regardless of which agent a thread is bound to.
@@ -54,16 +54,28 @@ Six model-usage roles, each independently overridable via env var, all falling b
 
 | Role | Env override | Used in |
 |---|---|---|
-| `scope` | `MODEL_SCOPE` | research_agent_scope.py (temperature=0.0) |
-| `research` | `MODEL_RESEARCH` | research_agent.py, research_agent_mcp.py |
-| `compress` | `MODEL_COMPRESS` | research_agent.py, research_agent_mcp.py (max_tokens=32000) |
-| `summarize` | `MODEL_SUMMARIZE` | utils.py webpage summarization |
+| `scope` | `MODEL_SCOPE` | research_agent_scope.py (temperature=0.0); also research_agent_sub.py's derive_checklist node (same lightweight-judgment role) |
+| `research` | `MODEL_RESEARCH` | research_agent_sub.py, research_agent_mcp.py |
+| `compress` | `MODEL_COMPRESS` | research_agent_mcp.py only (max_tokens=32000) — research_agent_sub.py dropped its own compress step, see below |
+| `extract` | `MODEL_EXTRACT` | utils.py per-link, brief-aware content extraction (formerly `summarize`/generic webpage summarization) |
 | `supervisor` | `MODEL_SUPERVISOR` | multi_agent_supervisor.py |
 | `report` | `MODEL_REPORT` | research_agent_full.py final report (max_tokens=32000) |
 
 `get_model(role)` in `config.py` returns a `ChatOpenAI` pointed at `base_url="https://openrouter.ai/api/v1"` — `ChatOpenAI`, not `init_chat_model`'s `"provider:model"` shorthand, because OpenRouter isn't a native LangChain provider prefix. Model names use OpenRouter's `provider/model` slug format, e.g. `openai/gpt-4.1`.
 
 **Important**: `config.py` uses `pydantic-settings`, which parses `.env` into its own `Settings` object and does **not** populate `os.environ`. If you add code that reads `os.environ[...]` directly (e.g. copying a pattern from another repo that calls `load_dotenv()`), it will silently fail to find values that are clearly set in `.env`. Thread values through explicit function arguments sourced from `get_settings()` instead (see `gdrive.py` for the pattern — this bit us once already during the original build).
+
+### research_agent_sub: per-link extraction, checklist coverage, safety net
+
+`research_agent_sub.py` (Graph 2, agent_id `research_agent_sub`) was redesigned from a "search → generic summarize → generic compress" pipeline into a brief-aware, citation-grounded one. Root cause this fixed: two stacked *generic* (brief-unaware) LLM rewrites — a per-page summary and a final holistic compression — could each independently drop specific facts that weren't obviously salient out of context, biased toward whatever surfaced early/broadly over hard-won, specific, late-arriving details. Real-world case: a multi-country research question lost one country's key fact entirely from the final handoff, despite half the searches targeting it.
+
+Pipeline: `START → derive_checklist → llm_call ⇄ tool_node → finalize_research → END`
+
+- **`derive_checklist`** — one-time structured-output call (reuses the `scope` role model) turning `research_topic` into `checklist: list[str]` (e.g. `["Germany", "Portugal"]` for a multi-country question, `[]` if the topic has no natural sub-parts). Also stamps `started_at` for the time-budget cap below, since it's always the first node.
+- **`tavily_search`** (`utils.py`) is now brief-aware: `tool_node` injects `research_topic`, `checklist`, and `already_visited` (the running `visited_urls` set) as `InjectedToolArg`s the LLM never sees or supplies — same hand-rolled special-casing pattern `research_agent_mcp.py` already used for `think_tool` vs MCP tools. For each unique URL in a search's results (already-visited URLs are skipped entirely, no re-extraction), it calls `extract_relevant_content()` — brief-aware, returns a `RelevantExtraction` (`relevant: bool`, `extracted_content: str` verbatim, `covers: list[str]` — which checklist items this page addresses). Returns `(formatted_text, list[extraction_record])`, not a bare string; `tool_node` unpacks this, appends the extraction records to state's `extractions` field, and folds newly-seen URLs into `visited_urls` (`Annotated[set[str], operator.or_]`) — this is the **cross-call link dedup**: revisiting the same URL across search rounds within one sub-agent run is now prevented, where before it was unmetered.
+- **`finalize_research`** replaces the old `compress_research` — **pure Python, no LLM call**. Concatenates every `relevant=true` extraction verbatim as `"SOURCE: {title} — {url}\n{extracted_content}"` into `research_findings` (renamed from `compressed_research`). Also computes `coverage_gaps = checklist items no surviving extraction covers` and attaches it to output state alongside `research_findings` — **informational only**, it does not override the model's own stop decision (no new control-flow risk from a heuristic that can't perfectly judge completeness).
+- **Safety net** (`config.py` settings, all env-overridable): `max_subagent_links` (10), `max_subagent_tool_iterations` (11, incremented once per `tool_node` call — deliberately a different field from the supervisor's own `max_researcher_iterations`, a different scope entirely, to avoid recreating the naming confusion that caused this redesign), `subagent_time_budget_seconds` (600), `subagent_call_timeout_seconds` (90, wraps `llm_call`'s `ainvoke` and each per-URL extraction call in `asyncio.wait_for`). Unlike the coverage flag above, `should_continue`'s link/iteration/time checks **do** override the model's own tool-call decision — this is a resource cap, not a quality judgment. A timed-out `llm_call` is treated as "no tool calls" (routes to `finalize_research`) rather than raising, since `threads.py`'s bare `except Exception` would otherwise mark the whole thread `"failed"` for one slow call. A timed-out/errored per-URL extraction is skipped without marking that URL visited, so it can be retried by a later search — distinct from a considered `relevant=false` judgment, which does count as visited.
+- **`research_agent_mcp.py` intentionally still has its own LLM-based `compress_research` step** — it reads local files via MCP, not Tavily, so none of the above applies to it. It only picked up the `compressed_research` → `research_findings` field rename, since both graphs share `ResearcherState`/`ResearcherOutputState`.
 
 ### Persistence
 
@@ -95,7 +107,7 @@ WAL mode is enabled explicitly in `ThreadStore.connect()` to avoid `database is 
 
 Required env vars (see `.env.example`):
 - `OPENROUTER_API_KEY` — routes all LLM calls
-- `TAVILY_API_KEY` — web search for research_agent / research_agent_mcp's sibling graphs (research_agent_mcp itself doesn't call Tavily, it reads local files, but the module still imports utils.py which constructs a TavilyClient at import time)
+- `TAVILY_API_KEY` — web search for research_agent_sub / research_agent_mcp's sibling graphs (research_agent_mcp itself doesn't call Tavily, it reads local files, but the module still imports utils.py which constructs an `AsyncTavilyClient` at import time)
 
 Optional:
 - `DEFAULT_MODEL` (default `openai/gpt-4.1`) and per-role `MODEL_*` overrides

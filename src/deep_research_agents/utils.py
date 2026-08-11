@@ -1,9 +1,10 @@
 """Research Utilities and Tools.
 
 This module provides search and content processing utilities for the research agent,
-including web search capabilities and content summarization tools.
+including web search capabilities and brief-aware content extraction tools.
 """
 
+import asyncio
 from pathlib import Path
 from datetime import datetime
 from typing_extensions import Annotated, List, Literal
@@ -11,11 +12,11 @@ from typing_extensions import Annotated, List, Literal
 from langchain_core.messages import HumanMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool, InjectedToolArg
-from tavily import TavilyClient
+from tavily import AsyncTavilyClient
 
-from deep_research_agents.config import get_model, get_settings
-from deep_research_agents.state_research import Summary
-from deep_research_agents.prompts import summarize_webpage_prompt
+from deep_research_agents.config import get_model, get_settings, session_kwargs
+from deep_research_agents.state_research import RelevantExtraction
+from deep_research_agents.prompts import extract_relevant_content_prompt
 
 # ===== UTILITY FUNCTIONS =====
 
@@ -38,74 +39,53 @@ def get_current_dir() -> Path:
 
 # ===== CONFIGURATION =====
 
-summarization_model = get_model("summarize")
-tavily_client = TavilyClient(api_key=get_settings().tavily_api_key)
+extraction_model = get_model("extract")
+tavily_client = AsyncTavilyClient(api_key=get_settings().tavily_api_key)
 
 # ===== SEARCH FUNCTIONS =====
 
-def tavily_search_multiple(
-    search_queries: List[str],
-    max_results: int = 3,
-    topic: Literal["general", "news", "finance"] = "general",
-    include_raw_content: bool = True,
-) -> List[dict]:
-    """Perform search using Tavily API for multiple queries.
+async def extract_relevant_content(
+    webpage_content: str,
+    research_topic: str,
+    checklist: List[str],
+    search_query: str,
+    session_id: str | None = None,
+) -> RelevantExtraction | None:
+    """Extract topic-relevant, verbatim content from a webpage via the configured extraction model.
 
     Args:
-        search_queries: List of search queries to execute
-        max_results: Maximum number of results per query
-        topic: Topic filter for search results
-        include_raw_content: Whether to include raw webpage content
+        webpage_content: Raw webpage content to extract from
+        research_topic: The specific research topic/brief guiding relevance
+        checklist: Sub-topics/entities this content should be checked for coverage of
+        search_query: The specific tavily_search query that surfaced this URL — the
+            primary relevance anchor (see extract_relevant_content_prompt), with
+            research_topic kept as broader context so on-brief-but-off-query content
+            (e.g. a page that corrects a wrong assumption in the query) isn't dropped.
+        session_id: OpenRouter session grouping key (the LangGraph thread_id), if known
 
     Returns:
-        List of search result dictionaries
-    """
-
-    # Execute searches sequentially. Note: yon can use AsyncTavilyClient to parallelize this step.
-    search_docs = []
-    for query in search_queries:
-        result = tavily_client.search(
-            query,
-            max_results=max_results,
-            include_raw_content=include_raw_content,
-            topic=topic
-        )
-        search_docs.append(result)
-
-    return search_docs
-
-def summarize_webpage_content(webpage_content: str) -> str:
-    """Summarize webpage content using the configured summarization model.
-
-    Args:
-        webpage_content: Raw webpage content to summarize
-
-    Returns:
-        Formatted summary with key excerpts
+        A RelevantExtraction (which may itself have relevant=False — a considered
+        "not relevant" judgment). Returns None on timeout/error instead of raising —
+        that's a distinct "we don't know" case the caller skips without marking the
+        URL visited, so it can be retried, rather than a permanent negative judgment.
     """
     try:
-        # Set up structured output model for summarization
-        structured_model = summarization_model.with_structured_output(Summary)
-
-        # Generate summary
-        summary = structured_model.invoke([
-            HumanMessage(content=summarize_webpage_prompt.format(
-                webpage_content=webpage_content,
-                date=get_today_str()
-            ))
-        ])
-
-        # Format summary with clear structure
-        formatted_summary = (
-            f"<summary>\n{summary.summary}\n</summary>\n\n"
-            f"<key_excerpts>\n{summary.key_excerpts}\n</key_excerpts>"
+        structured_model = extraction_model.with_structured_output(RelevantExtraction)
+        return await asyncio.wait_for(
+            structured_model.ainvoke([
+                HumanMessage(content=extract_relevant_content_prompt.format(
+                    webpage_content=webpage_content,
+                    research_topic=research_topic,
+                    checklist=", ".join(checklist) if checklist else "(none specified)",
+                    search_query=search_query,
+                    date=get_today_str(),
+                ))
+            ], **session_kwargs(session_id)),
+            timeout=get_settings().subagent_call_timeout_seconds,
         )
-
-        return formatted_summary
-
     except Exception as e:
-        print(f"Failed to summarize webpage: {str(e)}")
-        return webpage_content[:1000] + "..." if len(webpage_content) > 1000 else webpage_content
+        print(f"Failed to extract relevant content: {str(e)}")
+        return None
 
 def deduplicate_search_results(search_results: List[dict]) -> dict:
     """Deduplicate search results by URL to avoid processing duplicate content.
@@ -126,88 +106,88 @@ def deduplicate_search_results(search_results: List[dict]) -> dict:
 
     return unique_results
 
-def process_search_results(unique_results: dict) -> dict:
-    """Process search results by summarizing content where available.
-
-    Args:
-        unique_results: Dictionary of unique search results
-
-    Returns:
-        Dictionary of processed results with summaries
-    """
-    summarized_results = {}
-
-    for url, result in unique_results.items():
-        # Use existing content if no raw content for summarization
-        if not result.get("raw_content"):
-            content = result['content']
-        else:
-            # Summarize raw content for better processing
-            content = summarize_webpage_content(result['raw_content'])
-
-        summarized_results[url] = {
-            'title': result['title'],
-            'content': content
-        }
-
-    return summarized_results
-
-def format_search_output(summarized_results: dict) -> str:
-    """Format search results into a well-structured string output.
-
-    Args:
-        summarized_results: Dictionary of processed search results
-
-    Returns:
-        Formatted string of search results with clear source separation
-    """
-    if not summarized_results:
-        return "No valid search results found. Please try different search queries or use a different search API."
-
-    formatted_output = "Search results: \n\n"
-
-    for i, (url, result) in enumerate(summarized_results.items(), 1):
-        formatted_output += f"\n\n--- SOURCE {i}: {result['title']} ---\n"
-        formatted_output += f"URL: {url}\n\n"
-        formatted_output += f"SUMMARY:\n{result['content']}\n\n"
-        formatted_output += "-" * 80 + "\n"
-
-    return formatted_output
-
 # ===== RESEARCH TOOLS =====
 
 @tool(parse_docstring=True)
-def tavily_search(
+async def tavily_search(
     query: str,
     max_results: Annotated[int, InjectedToolArg] = 3,
     topic: Annotated[Literal["general", "news", "finance"], InjectedToolArg] = "general",
-) -> str:
-    """Fetch results from Tavily search API with content summarization.
+    research_topic: Annotated[str, InjectedToolArg] = "",
+    checklist: Annotated[List[str], InjectedToolArg] = [],
+    already_visited: Annotated[set, InjectedToolArg] = frozenset(),
+    session_id: Annotated[str | None, InjectedToolArg] = None,
+) -> tuple[str, list[dict]]:
+    """Fetch results from Tavily search API with brief-aware content extraction.
 
     Args:
         query: A single search query to execute
         max_results: Maximum number of results to return
         topic: Topic to filter results by ('general', 'news', 'finance')
+        research_topic: The research brief guiding what content is relevant (injected by tool_node)
+        checklist: Sub-topics/entities to tag extracted content against (injected by tool_node)
+        already_visited: URLs already extracted in this run, to skip re-extracting (injected by tool_node)
+        session_id: OpenRouter session grouping key, the LangGraph thread_id (injected by tool_node)
 
     Returns:
-        Formatted string of search results with summaries
+        A tuple of (formatted string of relevant extracted content for the LLM,
+        list of per-URL extraction records for state aggregation).
     """
-    # Execute search for single query
-    search_results = tavily_search_multiple(
-        [query],  # Convert single query to list for the internal function
+    # Execute search
+    result = await tavily_client.search(
+        query,
         max_results=max_results,
-        topic=topic,
         include_raw_content=True,
+        topic=topic,
     )
 
     # Deduplicate results by URL to avoid processing duplicate content
-    unique_results = deduplicate_search_results(search_results)
+    unique_results = deduplicate_search_results([result])
 
-    # Process results with summarization
-    summarized_results = process_search_results(unique_results)
+    # Extract every not-yet-visited URL concurrently — total wait for the batch is
+    # bounded by the slowest single extraction call's timeout, not their sum.
+    to_extract = [(url, r) for url, r in unique_results.items() if url not in already_visited]
+    skipped_count = len(unique_results) - len(to_extract)
 
-    # Format output for consumption
-    return format_search_output(summarized_results)
+    extractions = await asyncio.gather(*[
+        extract_relevant_content(
+            r.get("raw_content") or r.get("content") or "",
+            research_topic, checklist, query, session_id,
+        )
+        for url, r in to_extract
+    ])
+
+    extraction_records = []
+    relevant_count = 0
+    formatted_output = "Search results: \n\n"
+
+    for (url, r), extraction in zip(to_extract, extractions):
+        if extraction is None:
+            # Timed out/errored — skip gracefully, don't mark visited, don't fail the batch
+            continue
+
+        extraction_records.append({
+            "url": url,
+            "title": r["title"],
+            "relevant": extraction.relevant,
+            "extracted_content": extraction.extracted_content,
+            "covers": extraction.covers,
+        })
+
+        if extraction.relevant:
+            relevant_count += 1
+            formatted_output += f"\n\n--- SOURCE {relevant_count}: {r['title']} ---\n"
+            formatted_output += f"URL: {url}\n\n"
+            formatted_output += f"{extraction.extracted_content}\n\n"
+            formatted_output += "-" * 80 + "\n"
+
+    if skipped_count:
+        formatted_output += f"\n({skipped_count} result(s) skipped — already visited in this research run.)\n"
+
+    if relevant_count == 0:
+        formatted_output += "\nNo relevant new information found in this search's results.\n"
+
+    return formatted_output, extraction_records
 
 @tool(parse_docstring=True)
 def think_tool(reflection: str) -> str:
