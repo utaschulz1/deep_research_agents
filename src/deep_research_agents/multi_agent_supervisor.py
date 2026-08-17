@@ -10,6 +10,7 @@ maintaining isolated context windows for each research topic.
 """
 
 import asyncio
+import logging
 
 from typing_extensions import Literal
 
@@ -32,6 +33,8 @@ from deep_research_agents.state_supervisor import (
     ResearchComplete
 )
 from deep_research_agents.utils import get_today_str, think_tool
+
+logger = logging.getLogger(__name__)
 
 def get_notes_from_tool_calls(messages: list[BaseMessage]) -> list[str]:
     """Extract research notes from ToolMessage objects in supervisor message history.
@@ -205,7 +208,10 @@ async def supervisor_tools(state: SupervisorState) -> Command[Literal["superviso
         # (e.g. a rate-limited parallel research call) silently ends the graph with
         # whatever notes were gathered so far, rather than retrying or surfacing the error.
         except Exception as e:
-            print(f"Error in supervisor tools: {e}")
+            # Not tagged with thread=<id> like research_agent_sub.py's logs — this
+            # node doesn't take config: RunnableConfig yet (separate known TODO,
+            # same one blocking session_id/coverage_gaps/stop_reason forwarding).
+            logger.error("Error in supervisor tools: %s", e)
             should_end = True
             next_step = END
 
