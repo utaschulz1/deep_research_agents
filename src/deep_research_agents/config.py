@@ -1,8 +1,10 @@
 """Settings and shared LLM model factory. The only place that knows about OpenRouter."""
+import logging
 from functools import lru_cache
 
 from langchain_core.runnables import RunnableConfig
 from langchain_openai import ChatOpenAI
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 ROLES = ("scope", "research", "compress", "extract", "supervisor", "report")
@@ -41,6 +43,23 @@ class Settings(BaseSettings):
     subagent_call_timeout_seconds: int = 90
 
     log_level: str = "INFO"
+
+    @field_validator("log_level")
+    @classmethod
+    def _normalize_log_level(cls, v: str) -> str:
+        """Upper-case and validate against logging's real level names.
+
+        logging.basicConfig(level=...) requires an exact-case match ("INFO",
+        not "info") and raises a fairly cryptic ValueError deep inside
+        api/main.py's import-time call otherwise. Normalizing here means a
+        lowercase LOG_LEVEL (e.g. Railway's env-var UI commonly encourages
+        this) or a typo fails fast with a clear message at Settings()
+        construction, instead of an obscure crash at app startup.
+        """
+        normalized = v.upper()
+        if not isinstance(getattr(logging, normalized, None), int):
+            raise ValueError(f"Invalid LOG_LEVEL {v!r} — expected one of DEBUG/INFO/WARNING/ERROR/CRITICAL")
+        return normalized
 
     sqlite_path: str = "data/threads.db"
 
