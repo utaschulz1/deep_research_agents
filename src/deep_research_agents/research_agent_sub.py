@@ -16,7 +16,7 @@ from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage, fi
 from langchain_core.runnables import RunnableConfig
 
 from deep_research_agents.config import get_model, get_settings, session_kwargs, thread_id_from_config
-from deep_research_agents.state_research import ResearcherState, ResearcherOutputState, ResearchChecklist
+from deep_research_agents.state_research import ResearcherState, ResearcherOutputState, ResearchChecklist, StopReason
 from deep_research_agents.utils import tavily_search, get_today_str, think_tool
 from deep_research_agents.prompts import research_agent_prompt, derive_checklist_prompt
 
@@ -148,11 +148,50 @@ async def tool_node(state: ResearcherState, config: RunnableConfig):
         "tool_call_iterations": state.get("tool_call_iterations", 0) + 1,
     }
 
+def _stop_reason(state: ResearcherState) -> StopReason | None:
+    """Why should_continue would route to finalize_research, or None to keep researching.
+
+    Checked in this order, matching should_continue's own precedence: a timed-out
+    llm_call first (no AIMessage was appended in that case, so the last message
+    may not even be an AIMessage with a .tool_calls attribute — this must be
+    checked before touching it), then the resource-cap safety net (these
+    override the model's own stop decision), then the model's own choice not to
+    call any more tools. should_continue and finalize_research both call this
+    (rather than one passing a value to the other) since LangGraph conditional
+    edge functions can't return state updates — only finalize_research, a real
+    node, can persist the result onto state.
+    """
+    if state.get("timed_out"):
+        return "llm_timeout"
+
+    settings = get_settings()
+    visited_urls = state.get("visited_urls", set())
+    tool_call_iterations = state.get("tool_call_iterations", 0)
+    started_at = state.get("started_at", time.time())
+
+    if len(visited_urls) >= settings.max_subagent_links:
+        return "link_cap"
+    if tool_call_iterations >= settings.max_subagent_tool_iterations:
+        return "iteration_cap"
+    if time.time() - started_at >= settings.subagent_time_budget_seconds:
+        return "time_budget"
+
+    last_message = state["researcher_messages"][-1]
+    if last_message.tool_calls:
+        return None  # keep researching
+
+    return "model_decided"
+
 def finalize_research(state: ResearcherState) -> dict:
     """Concatenate every relevant extraction into research_findings — pure Python, no LLM call.
 
     Also computes coverage_gaps against the derived checklist (point 4) —
-    informational only, does not affect routing within this graph.
+    informational only, does not affect routing within this graph. stop_reason
+    records *why* this node was reached at all — model_decided is the only
+    "research complete" case; the other four (llm_timeout/link_cap/
+    iteration_cap/time_budget) are a forced cutoff, which matters to anything
+    downstream that might otherwise read "research finished" as "the model was
+    satisfied it had enough."
 
     TODO: coverage_gaps is not read anywhere yet. It's meant to eventually be
     surfaced to multi_agent_supervisor.py (e.g. folded into the ToolMessage
@@ -186,41 +225,18 @@ def finalize_research(state: ResearcherState) -> dict:
     return {
         "research_findings": research_findings,
         "coverage_gaps": coverage_gaps,
+        # finalize_research is only ever reached via should_continue routing
+        # here, so _stop_reason is never actually None at this point — the
+        # fallback just avoids a bare None leaking into StopReason's type.
+        "stop_reason": _stop_reason(state) or "model_decided",
         "raw_notes": ["\n".join(raw_notes)],
     }
 
 # ===== ROUTING LOGIC =====
 
 def should_continue(state: ResearcherState) -> Literal["tool_node", "finalize_research"]:
-    """Determine whether to continue research or finalize.
-
-    A timed-out llm_call is checked first, before touching the last message at
-    all — no AIMessage was appended in that case, so state["researcher_messages"]
-    still ends on a prior ToolMessage/HumanMessage, which has no .tool_calls
-    attribute to read. Point 5 safety net is checked next and, unlike point 4's
-    coverage flag, DOES override the model's own stop decision — it's a resource
-    cap, not a quality judgment. Otherwise, falls through to the existing
-    tool-call-based routing.
-    """
-    if state.get("timed_out"):
-        return "finalize_research"
-
-    settings = get_settings()
-    visited_urls = state.get("visited_urls", set())
-    tool_call_iterations = state.get("tool_call_iterations", 0)
-    started_at = state.get("started_at", time.time())
-
-    if (
-        len(visited_urls) >= settings.max_subagent_links
-        or tool_call_iterations >= settings.max_subagent_tool_iterations
-        or time.time() - started_at >= settings.subagent_time_budget_seconds
-    ):
-        return "finalize_research"
-
-    last_message = state["researcher_messages"][-1]
-    if last_message.tool_calls:
-        return "tool_node"
-    return "finalize_research"
+    """Determine whether to continue research or finalize — see _stop_reason for the checks."""
+    return "finalize_research" if _stop_reason(state) is not None else "tool_node"
 
 # ===== GRAPH CONSTRUCTION =====
 

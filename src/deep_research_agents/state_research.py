@@ -6,12 +6,17 @@ the research agent workflow, including researcher state management and output sc
 """
 
 import operator
-from typing_extensions import TypedDict, Annotated, List, Sequence
+from typing_extensions import TypedDict, Annotated, List, Literal, Sequence
 from pydantic import BaseModel, Field
 from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
 
 # ===== STATE DEFINITIONS =====
+
+# Why should_continue routed a sub-agent run to finalize_research, distinct from
+# "research complete" in the sense of a satisfied model: only "model_decided" is
+# that; the other four are resource caps or failures that cut research short.
+StopReason = Literal["model_decided", "llm_timeout", "link_cap", "iteration_cap", "time_budget"]
 
 class ResearcherState(TypedDict):
     """
@@ -32,6 +37,7 @@ class ResearcherState(TypedDict):
     coverage_gaps: List[str]
     raw_notes: Annotated[List[str], operator.add]
     timed_out: bool
+    stop_reason: StopReason
 
 class ResearcherOutputState(TypedDict):
     """
@@ -39,10 +45,12 @@ class ResearcherOutputState(TypedDict):
 
     This represents the final output of the research process: the concatenated,
     per-link extraction findings, informational coverage gaps against the
-    derived checklist, and all raw notes from the research process.
+    derived checklist, why the run stopped, and all raw notes from the research
+    process.
     """
     research_findings: str
     coverage_gaps: List[str]
+    stop_reason: StopReason
     raw_notes: Annotated[List[str], operator.add]
     researcher_messages: Annotated[Sequence[BaseMessage], add_messages]
 
