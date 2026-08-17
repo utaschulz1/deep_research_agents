@@ -31,6 +31,7 @@ class ResearcherState(TypedDict):
     research_findings: str
     coverage_gaps: List[str]
     raw_notes: Annotated[List[str], operator.add]
+    timed_out: bool
 
 class ResearcherOutputState(TypedDict):
     """

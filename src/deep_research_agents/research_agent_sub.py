@@ -12,7 +12,7 @@ import time
 from typing_extensions import Literal
 
 from langgraph.graph import StateGraph, START, END
-from langchain_core.messages import AIMessage, SystemMessage, HumanMessage, ToolMessage, filter_messages
+from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage, filter_messages
 from langchain_core.runnables import RunnableConfig
 
 from deep_research_agents.config import get_model, get_settings, session_kwargs, thread_id_from_config
@@ -37,17 +37,33 @@ async def derive_checklist(state: ResearcherState, config: RunnableConfig) -> di
     """One-time, run-start structured-output call turning research_topic into a checklist.
 
     Also stamps started_at for point 5's time budget, since this is always the
-    first node the graph runs.
+    first node the graph runs. Wrapped in the same timeout as every other model
+    call in this file — a hang here used to skip stamping started_at entirely,
+    which would silently disable the whole time-budget safety net. On timeout we
+    fall back to checklist=[], the same value a single-topic question already
+    produces, so this degrades gracefully rather than failing the run.
+
+    TODO: when multi_agent_supervisor.py / research_agent_mcp.py get their own
+    redesign pass, apply this same asyncio.wait_for(subagent_call_timeout_seconds)
+    pattern to their LLM calls too — nothing wraps them today.
     """
+    settings = get_settings()
     structured_model = checklist_model.with_structured_output(ResearchChecklist)
-    result = await structured_model.ainvoke([
-        HumanMessage(content=derive_checklist_prompt.format(
-            research_topic=state["research_topic"],
-            date=get_today_str(),
-        ))
-    ], **session_kwargs(thread_id_from_config(config)))
+    try:
+        result = await asyncio.wait_for(
+            structured_model.ainvoke([
+                HumanMessage(content=derive_checklist_prompt.format(
+                    research_topic=state["research_topic"],
+                    date=get_today_str(),
+                ))
+            ], **session_kwargs(thread_id_from_config(config))),
+            timeout=settings.subagent_call_timeout_seconds,
+        )
+        checklist = result.checklist
+    except asyncio.TimeoutError:
+        checklist = []
     return {
-        "checklist": result.checklist,
+        "checklist": checklist,
         "started_at": time.time(),
     }
 
@@ -58,10 +74,14 @@ async def llm_call(state: ResearcherState, config: RunnableConfig):
     1. Call search tools to gather more information
     2. Provide a final answer based on gathered information
 
-    Returns updated state with the model's response. A per-call timeout treats a
-    hung call as "no tool calls" (routes to finalize_research) rather than raising —
-    the caller's bare `except Exception` would otherwise mark the whole thread failed
-    for what's really just one slow call.
+    Returns updated state with the model's response. A per-call timeout sets the
+    timed_out flag (checked first by should_continue, which routes straight to
+    finalize_research) rather than raising — the caller's bare `except Exception`
+    would otherwise mark the whole thread failed for what's really just one slow
+    call. No fabricated AIMessage is added to history: researcher_messages is
+    checkpointed per-thread, so a synthetic "I decided to stop" message would
+    persist and be replayed to the model on any later resume of this thread,
+    indistinguishable from a genuine self-produced decision.
     """
     settings = get_settings()
     try:
@@ -73,7 +93,7 @@ async def llm_call(state: ResearcherState, config: RunnableConfig):
             timeout=settings.subagent_call_timeout_seconds,
         )
     except asyncio.TimeoutError:
-        response = AIMessage(content="[llm_call timed out — stopping research for this sub-agent]")
+        return {"timed_out": True}
 
     return {"researcher_messages": [response]}
 
@@ -132,7 +152,15 @@ def finalize_research(state: ResearcherState) -> dict:
     """Concatenate every relevant extraction into research_findings — pure Python, no LLM call.
 
     Also computes coverage_gaps against the derived checklist (point 4) —
-    informational only, does not affect routing.
+    informational only, does not affect routing within this graph.
+
+    TODO: coverage_gaps is not read anywhere yet. It's meant to eventually be
+    surfaced to multi_agent_supervisor.py (e.g. folded into the ToolMessage
+    content alongside research_findings) so the supervisor can judge whether a
+    sub-agent's research actually covered its assigned sub-topic and decide
+    whether to re-dispatch. Wire this up when multi_agent_supervisor.py gets
+    its own redesign pass — today result.get("research_findings", ...) is the
+    only field multi_agent_supervisor.py reads off a sub-agent's output.
     """
     extractions = state.get("extractions", [])
     checklist = state.get("checklist", [])
@@ -166,10 +194,17 @@ def finalize_research(state: ResearcherState) -> dict:
 def should_continue(state: ResearcherState) -> Literal["tool_node", "finalize_research"]:
     """Determine whether to continue research or finalize.
 
-    Point 5 safety net is checked first and, unlike point 4's coverage flag, DOES
-    override the model's own stop decision — it's a resource cap, not a quality
-    judgment. Otherwise, falls through to the existing tool-call-based routing.
+    A timed-out llm_call is checked first, before touching the last message at
+    all — no AIMessage was appended in that case, so state["researcher_messages"]
+    still ends on a prior ToolMessage/HumanMessage, which has no .tool_calls
+    attribute to read. Point 5 safety net is checked next and, unlike point 4's
+    coverage flag, DOES override the model's own stop decision — it's a resource
+    cap, not a quality judgment. Otherwise, falls through to the existing
+    tool-call-based routing.
     """
+    if state.get("timed_out"):
+        return "finalize_research"
+
     settings = get_settings()
     visited_urls = state.get("visited_urls", set())
     tool_call_iterations = state.get("tool_call_iterations", 0)

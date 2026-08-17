@@ -65,27 +65,27 @@ async def extract_relevant_content(
 
     Returns:
         A RelevantExtraction (which may itself have relevant=False — a considered
-        "not relevant" judgment). Returns None on timeout/error instead of raising —
-        that's a distinct "we don't know" case the caller skips without marking the
-        URL visited, so it can be retried, rather than a permanent negative judgment.
+        "not relevant" judgment). Returns None if both attempts below fail — the
+        caller falls back to a raw excerpt of webpage_content rather than losing
+        the page's content outright.
     """
-    try:
-        structured_model = extraction_model.with_structured_output(RelevantExtraction)
-        return await asyncio.wait_for(
-            structured_model.ainvoke([
-                HumanMessage(content=extract_relevant_content_prompt.format(
-                    webpage_content=webpage_content,
-                    research_topic=research_topic,
-                    checklist=", ".join(checklist) if checklist else "(none specified)",
-                    search_query=search_query,
-                    date=get_today_str(),
-                ))
-            ], **session_kwargs(session_id)),
-            timeout=get_settings().subagent_call_timeout_seconds,
-        )
-    except Exception as e:
-        print(f"Failed to extract relevant content: {str(e)}")
-        return None
+    structured_model = extraction_model.with_structured_output(RelevantExtraction)
+    prompt = [HumanMessage(content=extract_relevant_content_prompt.format(
+        webpage_content=webpage_content,
+        research_topic=research_topic,
+        checklist=", ".join(checklist) if checklist else "(none specified)",
+        search_query=search_query,
+        date=get_today_str(),
+    ))]
+    for attempt in range(2):  # one retry, in case the first failure was transient
+        try:
+            return await asyncio.wait_for(
+                structured_model.ainvoke(prompt, **session_kwargs(session_id)),
+                timeout=get_settings().subagent_call_timeout_seconds,
+            )
+        except Exception as e:
+            print(f"extract_relevant_content attempt {attempt + 1} failed: {e}")
+    return None
 
 def deduplicate_search_results(search_results: List[dict]) -> dict:
     """Deduplicate search results by URL to avoid processing duplicate content.
@@ -114,7 +114,7 @@ async def tavily_search(
     max_results: Annotated[int, InjectedToolArg] = 3,
     topic: Annotated[Literal["general", "news", "finance"], InjectedToolArg] = "general",
     research_topic: Annotated[str, InjectedToolArg] = "",
-    checklist: Annotated[List[str], InjectedToolArg] = [],
+    checklist: Annotated[List[str] | None, InjectedToolArg] = None,
     already_visited: Annotated[set, InjectedToolArg] = frozenset(),
     session_id: Annotated[str | None, InjectedToolArg] = None,
 ) -> tuple[str, list[dict]]:
@@ -133,13 +133,21 @@ async def tavily_search(
         A tuple of (formatted string of relevant extracted content for the LLM,
         list of per-URL extraction records for state aggregation).
     """
-    # Execute search
-    result = await tavily_client.search(
-        query,
-        max_results=max_results,
-        include_raw_content=True,
-        topic=topic,
-    )
+    checklist = checklist or []  # default is None, not [], to avoid a shared mutable default
+
+    # Execute search, bounded by the same per-call timeout as everything downstream of it
+    try:
+        result = await asyncio.wait_for(
+            tavily_client.search(
+                query,
+                max_results=max_results,
+                include_raw_content=True,
+                topic=topic,
+            ),
+            timeout=get_settings().subagent_call_timeout_seconds,
+        )
+    except asyncio.TimeoutError:
+        return "Search timed out — no results for this query.\n", []
 
     # Deduplicate results by URL to avoid processing duplicate content
     unique_results = deduplicate_search_results([result])
@@ -163,7 +171,24 @@ async def tavily_search(
 
     for (url, r), extraction in zip(to_extract, extractions):
         if extraction is None:
-            # Timed out/errored — skip gracefully, don't mark visited, don't fail the batch
+            # Extraction failed even after retrying — fall back to a raw excerpt
+            # rather than losing the page's content entirely. Included in
+            # extraction_records (and therefore visited_urls) so it isn't
+            # reprocessed forever; extraction_failed marks it as unreviewed/raw
+            # rather than a considered relevance judgment.
+            raw = (r.get("raw_content") or r.get("content") or "")[:1000]
+            extraction_records.append({
+                "url": url,
+                "title": r["title"],
+                "relevant": True,
+                "extracted_content": raw,
+                "covers": [],
+                "extraction_failed": True,
+            })
+            relevant_count += 1
+            formatted_output += f"\n\n--- SOURCE {relevant_count}: {r['title']} (raw excerpt — extraction failed) ---\n"
+            formatted_output += f"URL: {url}\n\n{raw}\n\n"
+            formatted_output += "-" * 80 + "\n"
             continue
 
         extraction_records.append({
