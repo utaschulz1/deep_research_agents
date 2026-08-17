@@ -12,10 +12,11 @@ from datetime import datetime
 from typing_extensions import Literal
 
 from langchain_core.messages import HumanMessage, AIMessage, get_buffer_string
+from langchain_core.runnables import RunnableConfig
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import Command
 
-from deep_research_agents.config import get_model
+from deep_research_agents.config import get_model, session_kwargs, thread_id_from_config
 from deep_research_agents.prompts import clarify_with_user_instructions, transform_messages_into_research_topic_prompt
 from deep_research_agents.state_scope import AgentState, ClarifyWithUser, ResearchQuestion, AgentInputState
 
@@ -31,7 +32,7 @@ model = get_model("scope")
 
 # ===== WORKFLOW NODES =====
 
-def clarify_with_user(state: AgentState) -> Command[Literal["write_research_brief", "__end__"]]:
+def clarify_with_user(state: AgentState, config: RunnableConfig) -> Command[Literal["write_research_brief", "__end__"]]:
     """
     Determine if the user's request contains sufficient information to proceed with research.
 
@@ -47,7 +48,7 @@ def clarify_with_user(state: AgentState) -> Command[Literal["write_research_brie
             messages=get_buffer_string(messages=state["messages"]),
             date=get_today_str()
         ))
-    ])
+    ], **session_kwargs(thread_id_from_config(config)))
 
     # Route based on clarification need
     if response.need_clarification:
@@ -61,7 +62,7 @@ def clarify_with_user(state: AgentState) -> Command[Literal["write_research_brie
             update={"messages": [AIMessage(content=response.verification)]}
         )
 
-def write_research_brief(state: AgentState):
+def write_research_brief(state: AgentState, config: RunnableConfig):
     """
     Transform the conversation history into a comprehensive research brief.
 
@@ -77,7 +78,7 @@ def write_research_brief(state: AgentState):
             messages=get_buffer_string(state.get("messages", [])),
             date=get_today_str()
         ))
-    ])
+    ], **session_kwargs(thread_id_from_config(config)))
 
     # Update state with generated research brief and pass it to the supervisor
     return {

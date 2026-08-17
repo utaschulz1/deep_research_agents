@@ -25,7 +25,7 @@ from langgraph.types import Command
 
 from deep_research_agents.config import get_model, get_settings
 from deep_research_agents.prompts import lead_researcher_prompt
-from deep_research_agents.research_agent import researcher_agent
+from deep_research_agents.research_agent_sub import researcher_agent_sub
 from deep_research_agents.state_supervisor import (
     SupervisorState,
     ConductResearch,
@@ -168,7 +168,7 @@ async def supervisor_tools(state: SupervisorState) -> Command[Literal["superviso
             if conduct_research_calls:
                 # Launch parallel research agents
                 coros = [
-                    researcher_agent.ainvoke({
+                    researcher_agent_sub.ainvoke({
                         "researcher_messages": [
                             HumanMessage(content=tool_call["args"]["research_topic"])
                         ],
@@ -181,12 +181,12 @@ async def supervisor_tools(state: SupervisorState) -> Command[Literal["superviso
                 tool_results = await asyncio.gather(*coros)
 
                 # Format research results as tool messages
-                # Each sub-agent returns compressed research findings in result["compressed_research"]
-                # We write this compressed research as the content of a ToolMessage, which allows
+                # Each sub-agent returns its findings in result["research_findings"]
+                # We write this as the content of a ToolMessage, which allows
                 # the supervisor to later retrieve these findings via get_notes_from_tool_calls()
                 research_tool_messages = [
                     ToolMessage(
-                        content=result.get("compressed_research", "Error synthesizing research report"),
+                        content=result.get("research_findings", "Error synthesizing research report"),
                         name=tool_call["name"],
                         tool_call_id=tool_call["id"]
                     ) for result, tool_call in zip(tool_results, conduct_research_calls)

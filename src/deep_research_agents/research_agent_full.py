@@ -12,9 +12,10 @@ input through final report delivery.
 """
 
 from langchain_core.messages import HumanMessage
+from langchain_core.runnables import RunnableConfig
 from langgraph.graph import StateGraph, START, END
 
-from deep_research_agents.config import get_model
+from deep_research_agents.config import get_model, session_kwargs, thread_id_from_config
 from deep_research_agents.utils import get_today_str
 from deep_research_agents.prompts import final_report_generation_prompt
 from deep_research_agents.state_scope import AgentState, AgentInputState
@@ -27,7 +28,7 @@ writer_model = get_model("report")
 
 # ===== FINAL REPORT GENERATION =====
 
-async def final_report_generation(state: AgentState):
+async def final_report_generation(state: AgentState, config: RunnableConfig):
     """
     Final report generation node.
 
@@ -44,7 +45,10 @@ async def final_report_generation(state: AgentState):
         date=get_today_str()
     )
 
-    final_report = await writer_model.ainvoke([HumanMessage(content=final_report_prompt)])
+    final_report = await writer_model.ainvoke(
+        [HumanMessage(content=final_report_prompt)],
+        **session_kwargs(thread_id_from_config(config)),
+    )
 
     return {
         "final_report": final_report.content,
