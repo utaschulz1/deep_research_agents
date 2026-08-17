@@ -13,11 +13,12 @@ import time
 from typing_extensions import Literal
 
 from langgraph.graph import StateGraph, START, END
+from langgraph.types import Command
 from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage, filter_messages
 from langchain_core.runnables import RunnableConfig
 
 from deep_research_agents.config import get_model, get_settings, session_kwargs, thread_id_from_config
-from deep_research_agents.state_research import ResearcherState, ResearcherOutputState, ResearchChecklist, StopReason
+from deep_research_agents.state_research import ResearcherState, ResearcherOutputState, ResearchChecklist
 from deep_research_agents.utils import tavily_search, get_today_str, think_tool
 from deep_research_agents.prompts import research_agent_prompt, derive_checklist_prompt
 
@@ -73,24 +74,57 @@ async def derive_checklist(state: ResearcherState, config: RunnableConfig) -> di
         "started_at": time.time(),
     }
 
-async def llm_call(state: ResearcherState, config: RunnableConfig):
-    """Analyze current state and decide on next actions.
+async def llm_call(state: ResearcherState, config: RunnableConfig) -> Command[Literal["tool_node", "finalize_research"]]:
+    """Analyze current state, decide whether to keep researching, and route accordingly.
 
-    The model analyzes the current conversation state and decides whether to:
-    1. Call search tools to gather more information
-    2. Provide a final answer based on gathered information
+    This node owns the full stop/continue decision and returns a `Command` that
+    both picks the next node *and* writes `stop_reason` in one atomic step —
+    replacing a separate `should_continue` conditional-edge function plus a
+    shared `_stop_reason(state)` helper called independently from two places
+    (routing and `finalize_research`). That split had a real bug: `_stop_reason`
+    read `time.time()` fresh on each call, so the routing call and the
+    persisting call could disagree near the `subagent_time_budget_seconds`
+    boundary if real time (e.g. an async checkpoint write) elapsed between them
+    — mislabeling a genuine model-decided stop as a forced cutoff. Deciding
+    once, here, makes that race structurally impossible: there's only one
+    `time.time()` read and one place `stop_reason` is ever set.
 
-    Returns updated state with the model's response. A per-call timeout sets the
-    timed_out flag (checked first by should_continue, which routes straight to
-    finalize_research) rather than raising — the caller's bare `except Exception`
-    would otherwise mark the whole thread failed for what's really just one slow
-    call. No fabricated AIMessage is added to history: researcher_messages is
-    checkpointed per-thread, so a synthetic "I decided to stop" message would
-    persist and be replayed to the model on any later resume of this thread,
-    indistinguishable from a genuine self-produced decision.
+    Resource caps (links/iterations/time budget) are checked *before* calling
+    the model at all — state, previously, had already skipped a wasted LLM call
+    since should_continue only ever looked at these to override the model's
+    tool-call decision after the fact. Checking them first also means a capped
+    run doesn't spend one last (immediately-discarded) round-trip on a
+    now-moot response.
+
+    A per-call timeout routes straight to `finalize_research` with
+    `stop_reason="llm_timeout"` rather than raising — the caller's bare
+    `except Exception` would otherwise mark the whole thread failed for what's
+    really just one slow call. No fabricated AIMessage is added to history:
+    researcher_messages is checkpointed per-thread, so a synthetic "I decided
+    to stop" message would persist and be replayed to the model on any later
+    resume of this thread, indistinguishable from a genuine self-produced
+    decision.
     """
     thread_id = thread_id_from_config(config)
     settings = get_settings()
+
+    visited_urls = state.get("visited_urls", set())
+    tool_call_iterations = state.get("tool_call_iterations", 0)
+    started_at = state.get("started_at", time.time())
+
+    if len(visited_urls) >= settings.max_subagent_links:
+        stop_reason = "link_cap"
+    elif tool_call_iterations >= settings.max_subagent_tool_iterations:
+        stop_reason = "iteration_cap"
+    elif time.time() - started_at >= settings.subagent_time_budget_seconds:
+        stop_reason = "time_budget"
+    else:
+        stop_reason = None
+
+    if stop_reason is not None:
+        logger.warning("thread=%s llm_call: stop_reason=%s (resource cap, skipping model call)", thread_id, stop_reason)
+        return Command(goto="finalize_research", update={"stop_reason": stop_reason})
+
     try:
         response = await asyncio.wait_for(
             model_with_tools.ainvoke(
@@ -101,9 +135,15 @@ async def llm_call(state: ResearcherState, config: RunnableConfig):
         )
     except asyncio.TimeoutError:
         logger.warning("thread=%s llm_call timed out after %ss", thread_id, settings.subagent_call_timeout_seconds)
-        return {"timed_out": True}
+        return Command(goto="finalize_research", update={"stop_reason": "llm_timeout"})
 
-    return {"researcher_messages": [response]}
+    if response.tool_calls:
+        return Command(goto="tool_node", update={"researcher_messages": [response]})
+
+    return Command(
+        goto="finalize_research",
+        update={"researcher_messages": [response], "stop_reason": "model_decided"},
+    )
 
 async def tool_node(state: ResearcherState, config: RunnableConfig):
     """Execute all tool calls from the previous LLM response.
@@ -166,40 +206,6 @@ async def tool_node(state: ResearcherState, config: RunnableConfig):
         "tool_call_iterations": iteration,
     }
 
-def _stop_reason(state: ResearcherState) -> StopReason | None:
-    """Why should_continue would route to finalize_research, or None to keep researching.
-
-    Checked in this order, matching should_continue's own precedence: a timed-out
-    llm_call first (no AIMessage was appended in that case, so the last message
-    may not even be an AIMessage with a .tool_calls attribute — this must be
-    checked before touching it), then the resource-cap safety net (these
-    override the model's own stop decision), then the model's own choice not to
-    call any more tools. should_continue and finalize_research both call this
-    (rather than one passing a value to the other) since LangGraph conditional
-    edge functions can't return state updates — only finalize_research, a real
-    node, can persist the result onto state.
-    """
-    if state.get("timed_out"):
-        return "llm_timeout"
-
-    settings = get_settings()
-    visited_urls = state.get("visited_urls", set())
-    tool_call_iterations = state.get("tool_call_iterations", 0)
-    started_at = state.get("started_at", time.time())
-
-    if len(visited_urls) >= settings.max_subagent_links:
-        return "link_cap"
-    if tool_call_iterations >= settings.max_subagent_tool_iterations:
-        return "iteration_cap"
-    if time.time() - started_at >= settings.subagent_time_budget_seconds:
-        return "time_budget"
-
-    last_message = state["researcher_messages"][-1]
-    if last_message.tool_calls:
-        return None  # keep researching
-
-    return "model_decided"
-
 def finalize_research(state: ResearcherState, config: RunnableConfig) -> dict:
     """Concatenate every relevant extraction into research_findings — pure Python, no LLM call.
 
@@ -240,10 +246,10 @@ def finalize_research(state: ResearcherState, config: RunnableConfig) -> dict:
         )
     ]
 
-    # finalize_research is only ever reached via should_continue routing here,
-    # so _stop_reason is never actually None at this point — the fallback just
-    # avoids a bare None leaking into StopReason's type.
-    stop_reason = _stop_reason(state) or "model_decided"
+    # llm_call is the only place stop_reason is ever set, and it does so on
+    # every path that routes here via Command — guaranteed present by
+    # construction, no recomputation or fallback needed.
+    stop_reason = state["stop_reason"]
     log = logger.warning if stop_reason != "model_decided" else logger.info
     log(
         "thread=%s finalize_research: stop_reason=%s, %d/%d relevant extraction(s), coverage_gaps=%r",
@@ -257,12 +263,6 @@ def finalize_research(state: ResearcherState, config: RunnableConfig) -> dict:
         "raw_notes": ["\n".join(raw_notes)],
     }
 
-# ===== ROUTING LOGIC =====
-
-def should_continue(state: ResearcherState) -> Literal["tool_node", "finalize_research"]:
-    """Determine whether to continue research or finalize — see _stop_reason for the checks."""
-    return "finalize_research" if _stop_reason(state) is not None else "tool_node"
-
 # ===== GRAPH CONSTRUCTION =====
 
 # Build the agent workflow
@@ -274,17 +274,12 @@ researcher_agent_sub_builder.add_node("llm_call", llm_call)
 researcher_agent_sub_builder.add_node("tool_node", tool_node)
 researcher_agent_sub_builder.add_node("finalize_research", finalize_research)
 
-# Add edges to connect nodes
+# Add edges to connect nodes. llm_call routes itself via the Command it
+# returns (to "tool_node" or "finalize_research"), same pattern already used
+# by multi_agent_supervisor.py's supervisor/supervisor_tools — no
+# add_conditional_edges needed for it.
 researcher_agent_sub_builder.add_edge(START, "derive_checklist")
 researcher_agent_sub_builder.add_edge("derive_checklist", "llm_call")
-researcher_agent_sub_builder.add_conditional_edges(
-    "llm_call",
-    should_continue,
-    {
-        "tool_node": "tool_node",  # Continue research loop
-        "finalize_research": "finalize_research",  # Provide final answer
-    },
-)
 researcher_agent_sub_builder.add_edge("tool_node", "llm_call")  # Loop back for more research
 researcher_agent_sub_builder.add_edge("finalize_research", END)
 

@@ -13,9 +13,10 @@ from langgraph.graph.message import add_messages
 
 # ===== STATE DEFINITIONS =====
 
-# Why should_continue routed a sub-agent run to finalize_research, distinct from
-# "research complete" in the sense of a satisfied model: only "model_decided" is
-# that; the other four are resource caps or failures that cut research short.
+# Why llm_call's Command routed a sub-agent run to finalize_research, distinct
+# from "research complete" in the sense of a satisfied model: only
+# "model_decided" is that; the other four are resource caps or failures that
+# cut research short.
 StopReason = Literal["model_decided", "llm_timeout", "link_cap", "iteration_cap", "time_budget"]
 
 class ResearcherState(TypedDict):
@@ -36,7 +37,6 @@ class ResearcherState(TypedDict):
     research_findings: str
     coverage_gaps: List[str]
     raw_notes: Annotated[List[str], operator.add]
-    timed_out: bool
     stop_reason: StopReason
 
 class ResearcherOutputState(TypedDict):
