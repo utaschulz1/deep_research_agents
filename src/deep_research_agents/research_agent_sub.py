@@ -136,7 +136,20 @@ async def llm_call(state: ResearcherState, config: RunnableConfig) -> Command[Li
     except asyncio.TimeoutError:
         logger.warning("thread=%s llm_call timed out after %ss", thread_id, settings.subagent_call_timeout_seconds)
         return Command(goto="finalize_research", update={"stop_reason": "llm_timeout"})
+    except Exception as e:
+        # Broader than the timeout above on purpose: a rate limit, a malformed
+        # response, or any other model-call failure would otherwise propagate
+        # uncaught out of this node and fail the whole run for what, from the
+        # caller's perspective, is the same class of problem as a timeout --
+        # one bad round shouldn't lose whatever research this sub-agent has
+        # already gathered. Distinct stop_reason from llm_timeout so it's not
+        # mistaken for the (expected, budgeted-for) timeout case in logs/output.
+        logger.error("thread=%s llm_call failed: %s", thread_id, e)
+        return Command(goto="finalize_research", update={"stop_reason": "llm_error"})
 
+    # response is appended, not replacing prior history, via researcher_messages'
+    # add_messages reducer (state_research.py) -- returning [response] here is
+    # correct even though it looks like it would overwrite everything else.
     if response.tool_calls:
         return Command(goto="tool_node", update={"researcher_messages": [response]})
 
@@ -194,12 +207,25 @@ async def tool_node(state: ResearcherState, config: RunnableConfig):
             ToolMessage(content=content, name=tool_call["name"], tool_call_id=tool_call["id"])
         )
 
+    # Union, not a sum: new_urls is disjoint from the prior visited_urls today
+    # (to_extract already filters out already_visited), but a union is
+    # correct regardless of that invariant holding in the future -- e.g. a
+    # refetch-style tool that deliberately reprocesses an already-visited URL
+    # would make new_urls overlap, and len(a) + len(b) would then overcount.
+    total_visited = state.get("visited_urls", set()) | new_urls
     logger.info(
         "thread=%s tool_node round %d done: %d new URL(s) extracted, %d total visited",
-        session_id, iteration, len(new_urls), len(state.get("visited_urls", set())) + len(new_urls),
+        session_id, iteration, len(new_urls), len(total_visited),
     )
 
     return {
+        # extractions/visited_urls have reducers (operator.add/operator.or_ in
+        # state_research.py) that merge this round's values into the running
+        # total automatically -- these two fields are the round's *increment*,
+        # not the accumulated total. tool_call_iterations has no reducer (plain
+        # replace), so `iteration` above is computed as the accumulated total
+        # itself (old value + 1) and returned as-is -- an intentionally
+        # different pattern from its two neighbors here, not an oversight.
         "researcher_messages": tool_outputs,
         "extractions": new_extractions,
         "visited_urls": new_urls,

@@ -15,9 +15,9 @@ from langgraph.graph.message import add_messages
 
 # Why llm_call's Command routed a sub-agent run to finalize_research, distinct
 # from "research complete" in the sense of a satisfied model: only
-# "model_decided" is that; the other four are resource caps or failures that
+# "model_decided" is that; the other five are resource caps or failures that
 # cut research short.
-StopReason = Literal["model_decided", "llm_timeout", "link_cap", "iteration_cap", "time_budget"]
+StopReason = Literal["model_decided", "llm_timeout", "llm_error", "link_cap", "iteration_cap", "time_budget"]
 
 class ResearcherState(TypedDict):
     """
