@@ -1,4 +1,5 @@
 """FastAPI app: compiles all 5 registered graphs with a shared checkpointer at startup."""
+import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -9,6 +10,15 @@ from deep_research_agents.api.routers import agents, export, revise, threads
 from deep_research_agents.config import get_settings
 from deep_research_agents.db import ThreadStore
 from deep_research_agents.graphs import AGENT_REGISTRY
+
+# Configured once, at process start, before any node can log anything — LOG_LEVEL
+# env-overridable via Settings like everything else. Every module-level logger
+# (logging.getLogger(__name__)) inherits this via the root logger, no per-module
+# setup needed.
+logging.basicConfig(
+    level=get_settings().log_level,
+    format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+)
 
 
 @asynccontextmanager

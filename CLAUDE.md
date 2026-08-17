@@ -131,6 +131,7 @@ Optional:
 - `DEFAULT_MODEL` (default `openai/gpt-4.1`) and per-role `MODEL_*` overrides
 - `MAX_CONCURRENT_RESEARCHERS` (default `2` — deliberately lowered from the course's hardcoded `3`, which caused a real 429 rate-limit during development)
 - `MAX_RESEARCHER_ITERATIONS` (default `6`)
+- `LOG_LEVEL` (default `INFO`) — passed to `logging.basicConfig` once, at import time in `api/main.py`, before the app object is created. Every module just does `logger = logging.getLogger(__name__)` and inherits this via the root logger; no per-module setup needed. `research_agent_sub.py`/`utils.py` log each node's key decisions (checklist derived, tool calls dispatched, search/extraction results and failures, and `finalize_research`'s `stop_reason` — at `WARNING` when it's a forced cutoff, `INFO` when the model genuinely decided it was done) tagged with `thread=`/`session=<thread_id>` where available. Other agents (`multi_agent_supervisor.py` etc.) still use bare `print()` — not yet converted, since only `research_agent_sub` has had its logging pass so far.
 - `SQLITE_PATH` (default `data/threads.db`)
 - `GDRIVE_CLIENT_ID` / `GDRIVE_CLIENT_SECRET` / `GDRIVE_REFRESH_TOKEN` / `GDRIVE_BASE_PATH` — only needed for `/export`. This repo reuses the same Google Cloud OAuth client already set up for the sibling `patent-translation-app` project by default; that's a personal-account-hygiene choice, not a hard requirement — a fresh OAuth client works identically.
 

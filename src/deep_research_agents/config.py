@@ -40,6 +40,8 @@ class Settings(BaseSettings):
     subagent_time_budget_seconds: int = 600
     subagent_call_timeout_seconds: int = 90
 
+    log_level: str = "INFO"
+
     sqlite_path: str = "data/threads.db"
 
     gdrive_client_id: str | None = None

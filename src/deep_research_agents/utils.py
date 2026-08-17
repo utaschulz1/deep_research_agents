@@ -5,6 +5,7 @@ including web search capabilities and brief-aware content extraction tools.
 """
 
 import asyncio
+import logging
 from pathlib import Path
 from datetime import datetime
 from typing_extensions import Annotated, List, Literal
@@ -17,6 +18,8 @@ from tavily import AsyncTavilyClient
 from deep_research_agents.config import get_model, get_settings, session_kwargs
 from deep_research_agents.state_research import RelevantExtraction
 from deep_research_agents.prompts import extract_relevant_content_prompt
+
+logger = logging.getLogger(__name__)
 
 # ===== UTILITY FUNCTIONS =====
 
@@ -84,7 +87,10 @@ async def extract_relevant_content(
                 timeout=get_settings().subagent_call_timeout_seconds,
             )
         except Exception as e:
-            print(f"extract_relevant_content attempt {attempt + 1} failed: {e}")
+            logger.warning(
+                "extract_relevant_content attempt %d/2 failed for query=%r: %s",
+                attempt + 1, search_query, e,
+            )
     return None
 
 def deduplicate_search_results(search_results: List[dict]) -> dict:
@@ -147,6 +153,7 @@ async def tavily_search(
             timeout=get_settings().subagent_call_timeout_seconds,
         )
     except asyncio.TimeoutError:
+        logger.warning("session=%s tavily_search timed out for query=%r", session_id, query)
         return "Search timed out — no results for this query.\n", []
 
     # Deduplicate results by URL to avoid processing duplicate content
@@ -156,6 +163,10 @@ async def tavily_search(
     # bounded by the slowest single extraction call's timeout, not their sum.
     to_extract = [(url, r) for url, r in unique_results.items() if url not in already_visited]
     skipped_count = len(unique_results) - len(to_extract)
+    logger.info(
+        "session=%s tavily_search query=%r -> %d result(s), %d to extract, %d skipped (already visited)",
+        session_id, query, len(unique_results), len(to_extract), skipped_count,
+    )
 
     extractions = await asyncio.gather(*[
         extract_relevant_content(
@@ -176,6 +187,7 @@ async def tavily_search(
             # extraction_records (and therefore visited_urls) so it isn't
             # reprocessed forever; extraction_failed marks it as unreviewed/raw
             # rather than a considered relevance judgment.
+            logger.warning("session=%s extraction failed for url=%s, falling back to raw excerpt", session_id, url)
             raw = (r.get("raw_content") or r.get("content") or "")[:1000]
             extraction_records.append({
                 "url": url,

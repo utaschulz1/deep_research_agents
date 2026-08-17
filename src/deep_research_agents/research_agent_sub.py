@@ -7,6 +7,7 @@ a time, and is also independently reachable as its own graph via AGENT_REGISTRY.
 """
 
 import asyncio
+import logging
 import time
 
 from typing_extensions import Literal
@@ -19,6 +20,8 @@ from deep_research_agents.config import get_model, get_settings, session_kwargs,
 from deep_research_agents.state_research import ResearcherState, ResearcherOutputState, ResearchChecklist, StopReason
 from deep_research_agents.utils import tavily_search, get_today_str, think_tool
 from deep_research_agents.prompts import research_agent_prompt, derive_checklist_prompt
+
+logger = logging.getLogger(__name__)
 
 # ===== CONFIGURATION =====
 
@@ -47,6 +50,7 @@ async def derive_checklist(state: ResearcherState, config: RunnableConfig) -> di
     redesign pass, apply this same asyncio.wait_for(subagent_call_timeout_seconds)
     pattern to their LLM calls too — nothing wraps them today.
     """
+    thread_id = thread_id_from_config(config)
     settings = get_settings()
     structured_model = checklist_model.with_structured_output(ResearchChecklist)
     try:
@@ -56,12 +60,14 @@ async def derive_checklist(state: ResearcherState, config: RunnableConfig) -> di
                     research_topic=state["research_topic"],
                     date=get_today_str(),
                 ))
-            ], **session_kwargs(thread_id_from_config(config))),
+            ], **session_kwargs(thread_id)),
             timeout=settings.subagent_call_timeout_seconds,
         )
         checklist = result.checklist
+        logger.info("thread=%s derive_checklist -> %r", thread_id, checklist)
     except asyncio.TimeoutError:
         checklist = []
+        logger.warning("thread=%s derive_checklist timed out, falling back to checklist=[]", thread_id)
     return {
         "checklist": checklist,
         "started_at": time.time(),
@@ -83,16 +89,18 @@ async def llm_call(state: ResearcherState, config: RunnableConfig):
     persist and be replayed to the model on any later resume of this thread,
     indistinguishable from a genuine self-produced decision.
     """
+    thread_id = thread_id_from_config(config)
     settings = get_settings()
     try:
         response = await asyncio.wait_for(
             model_with_tools.ainvoke(
                 [SystemMessage(content=research_agent_prompt)] + state["researcher_messages"],
-                **session_kwargs(thread_id_from_config(config)),
+                **session_kwargs(thread_id),
             ),
             timeout=settings.subagent_call_timeout_seconds,
         )
     except asyncio.TimeoutError:
+        logger.warning("thread=%s llm_call timed out after %ss", thread_id, settings.subagent_call_timeout_seconds)
         return {"timed_out": True}
 
     return {"researcher_messages": [response]}
@@ -107,6 +115,11 @@ async def tool_node(state: ResearcherState, config: RunnableConfig):
     """
     tool_calls = state["researcher_messages"][-1].tool_calls
     session_id = thread_id_from_config(config)
+    iteration = state.get("tool_call_iterations", 0) + 1
+    logger.info(
+        "thread=%s tool_node round %d: dispatching %s",
+        session_id, iteration, [tc["name"] for tc in tool_calls],
+    )
 
     async def _invoke_tool(tool_call):
         tool = tools_by_name[tool_call["name"]]
@@ -141,11 +154,16 @@ async def tool_node(state: ResearcherState, config: RunnableConfig):
             ToolMessage(content=content, name=tool_call["name"], tool_call_id=tool_call["id"])
         )
 
+    logger.info(
+        "thread=%s tool_node round %d done: %d new URL(s) extracted, %d total visited",
+        session_id, iteration, len(new_urls), len(state.get("visited_urls", set())) + len(new_urls),
+    )
+
     return {
         "researcher_messages": tool_outputs,
         "extractions": new_extractions,
         "visited_urls": new_urls,
-        "tool_call_iterations": state.get("tool_call_iterations", 0) + 1,
+        "tool_call_iterations": iteration,
     }
 
 def _stop_reason(state: ResearcherState) -> StopReason | None:
@@ -182,7 +200,7 @@ def _stop_reason(state: ResearcherState) -> StopReason | None:
 
     return "model_decided"
 
-def finalize_research(state: ResearcherState) -> dict:
+def finalize_research(state: ResearcherState, config: RunnableConfig) -> dict:
     """Concatenate every relevant extraction into research_findings — pure Python, no LLM call.
 
     Also computes coverage_gaps against the derived checklist (point 4) —
@@ -222,13 +240,20 @@ def finalize_research(state: ResearcherState) -> dict:
         )
     ]
 
+    # finalize_research is only ever reached via should_continue routing here,
+    # so _stop_reason is never actually None at this point — the fallback just
+    # avoids a bare None leaking into StopReason's type.
+    stop_reason = _stop_reason(state) or "model_decided"
+    log = logger.warning if stop_reason != "model_decided" else logger.info
+    log(
+        "thread=%s finalize_research: stop_reason=%s, %d/%d relevant extraction(s), coverage_gaps=%r",
+        thread_id_from_config(config), stop_reason, len(relevant), len(extractions), coverage_gaps,
+    )
+
     return {
         "research_findings": research_findings,
         "coverage_gaps": coverage_gaps,
-        # finalize_research is only ever reached via should_continue routing
-        # here, so _stop_reason is never actually None at this point — the
-        # fallback just avoids a bare None leaking into StopReason's type.
-        "stop_reason": _stop_reason(state) or "model_decided",
+        "stop_reason": stop_reason,
         "raw_notes": ["\n".join(raw_notes)],
     }
 
